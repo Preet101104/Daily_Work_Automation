@@ -2,3 +2,5 @@ google-genai
 python-dotenv
 docxtpl
 pydantic
+docx2pdf
+ 
