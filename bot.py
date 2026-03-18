@@ -55,8 +55,7 @@ def sanitize_for_xml(value):
 def create_word_document(
     updates: FinancialUpdates,
     template_filename="template.docx",
-    output_filename="newsletter_output.docx",
-    pdf_filename="newsletter_output.pdf"
+    output_filename="newsletter_output.docx"
 ) -> bool:
     try:
         doc = DocxTemplate(template_filename)
@@ -64,41 +63,8 @@ def create_word_document(
         doc.render(context)
         doc.save(output_filename)
         print(f"\n✅ Newsletter DOCX generated successfully: {output_filename}")
-
-        print("\n📄 Converting Word document to PDF via LibreOffice...")
-
-        output_dir = os.path.dirname(os.path.abspath(pdf_filename))
-        result = subprocess.run(
-            [
-                "libreoffice",
-                "--headless",
-                "--convert-to", "pdf",
-                "--outdir", output_dir,
-                os.path.abspath(output_filename),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-
-        if result.returncode != 0:
-            print(f"❌ LibreOffice conversion error:\n{result.stderr}")
-            return False
-
-        # LibreOffice names the output after the input file, so rename if needed
-        auto_pdf = os.path.join(
-            output_dir,
-            os.path.splitext(os.path.basename(output_filename))[0] + ".pdf"
-        )
-        if auto_pdf != os.path.abspath(pdf_filename):
-            os.replace(auto_pdf, pdf_filename)
-
-        print(f"✅ Newsletter PDF generated successfully: {pdf_filename}")
         return True
 
-    except subprocess.TimeoutExpired:
-        print("❌ LibreOffice conversion timed out.")
-        return False
     except Exception as e:
         print(f"\n❌ Document generation error: {e}")
         return False
@@ -195,18 +161,16 @@ async def extract_financial_updates(pdf_paths: List[str], base_filename: str) ->
         print("✅ News extraction completed")
 
         docx_path = f"{base_filename}.docx"
-        pdf_path_output = f"{base_filename}.pdf"
 
         success = await asyncio.to_thread(
             create_word_document,
             structured_data,
             "template.docx",
-            docx_path,
-            pdf_path_output
+            docx_path
         )
 
         if success:
-            return pdf_path_output
+            return docx_path
         return None
 
     except Exception as e:
@@ -288,18 +252,18 @@ async def generate_newsletter(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Clean up files older than 24 hours before processing
     cleanup_old_files("downloads", max_age_hours=24)
 
-    await update.message.reply_text("⏳ Processing your documents with Gemini AI... Please wait, this may take a minute!")
+    await update.message.reply_text("⏳ Processing your documents ... Please wait, this may take a minute!")
 
     try:
         base_filename = f"downloads/newsletter_{chat_id}"
 
-        output_pdf = await extract_financial_updates(pdfs, base_filename)
+        output_docx = await extract_financial_updates(pdfs, base_filename)
 
-        if output_pdf and os.path.exists(output_pdf):
-            with open(output_pdf, 'rb') as doc:
+        if output_docx and os.path.exists(output_docx):
+            with open(output_docx, 'rb') as doc:
                 await update.message.reply_document(
                     document=doc,
-                    filename="Financial_Newsletter.pdf",
+                    filename="ECM_Daily_Update.docx",
                     caption="✅ Here is your summarized newsletter!"
                 )
         else:
