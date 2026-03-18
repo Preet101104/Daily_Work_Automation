@@ -3,4 +3,4 @@ python-dotenv
 docxtpl
 pydantic
 docx2pdf
- 
+python-telegram-bot

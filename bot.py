@@ -1,13 +1,13 @@
 import os
+import time
 import asyncio
-import pythoncom
+import subprocess
 from typing import List, Dict
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 from docxtpl import DocxTemplate
-from docx2pdf import convert
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -35,6 +35,23 @@ class FinancialUpdates(BaseModel):
 # WORD DOCUMENT GENERATOR
 # -----------------------------
 
+def sanitize_for_xml(value):
+    """Recursively sanitize strings in dicts/lists to be XML-safe."""
+    if isinstance(value, str):
+        return (
+            value
+            .replace("&", "and")   # must be first
+            .replace("<", "(")
+            .replace(">", ")")
+            .replace('"', "'")
+        )
+    elif isinstance(value, list):
+        return [sanitize_for_xml(v) for v in value]
+    elif isinstance(value, dict):
+        return {k: sanitize_for_xml(v) for k, v in value.items()}
+    return value
+
+
 def create_word_document(
     updates: FinancialUpdates,
     template_filename="template.docx",
@@ -42,24 +59,49 @@ def create_word_document(
     pdf_filename="newsletter_output.pdf"
 ) -> bool:
     try:
-        # Initialize COM for the background thread
-        pythoncom.CoInitialize()
-        
         doc = DocxTemplate(template_filename)
-        context = updates.model_dump(exclude_none=True)
+        context = sanitize_for_xml(updates.model_dump(exclude_none=True))
         doc.render(context)
         doc.save(output_filename)
         print(f"\n✅ Newsletter DOCX generated successfully: {output_filename}")
-        
-        print("\n📄 Converting Word document to PDF...")
-        convert(output_filename, pdf_filename)
+
+        print("\n📄 Converting Word document to PDF via LibreOffice...")
+
+        output_dir = os.path.dirname(os.path.abspath(pdf_filename))
+        result = subprocess.run(
+            [
+                "libreoffice",
+                "--headless",
+                "--convert-to", "pdf",
+                "--outdir", output_dir,
+                os.path.abspath(output_filename),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+        if result.returncode != 0:
+            print(f"❌ LibreOffice conversion error:\n{result.stderr}")
+            return False
+
+        # LibreOffice names the output after the input file, so rename if needed
+        auto_pdf = os.path.join(
+            output_dir,
+            os.path.splitext(os.path.basename(output_filename))[0] + ".pdf"
+        )
+        if auto_pdf != os.path.abspath(pdf_filename):
+            os.replace(auto_pdf, pdf_filename)
+
         print(f"✅ Newsletter PDF generated successfully: {pdf_filename}")
         return True
+
+    except subprocess.TimeoutExpired:
+        print("❌ LibreOffice conversion timed out.")
+        return False
     except Exception as e:
         print(f"\n❌ Document generation error: {e}")
         return False
-    finally:
-        pythoncom.CoUninitialize()
 
 
 # -----------------------------
@@ -136,7 +178,7 @@ async def extract_financial_updates(pdf_paths: List[str], base_filename: str) ->
             print(f"Uploading {pdf_path}")
             uploaded_file = await asyncio.to_thread(client.files.upload, file=pdf_path)
             uploaded_files.append(uploaded_file)
-            
+
         print("🔎 Analyzing newspapers with Gemini 2.5 Flash...\n")
         response = await asyncio.to_thread(
             client.models.generate_content,
@@ -155,7 +197,6 @@ async def extract_financial_updates(pdf_paths: List[str], base_filename: str) ->
         docx_path = f"{base_filename}.docx"
         pdf_path_output = f"{base_filename}.pdf"
 
-        # Export via a thread because COM via docx2pdf needs to avoid blocking bot async loop
         success = await asyncio.to_thread(
             create_word_document,
             structured_data,
@@ -171,6 +212,29 @@ async def extract_financial_updates(pdf_paths: List[str], base_filename: str) ->
     except Exception as e:
         print(f"\n❌ Gemini processing error: {e}")
         return None
+
+
+# -----------------------------
+# AUTO CLEANUP
+# -----------------------------
+
+def cleanup_old_files(folder: str = "downloads", max_age_hours: int = 24):
+    """Delete all files in folder older than max_age_hours."""
+    if not os.path.exists(folder):
+        return
+    now = time.time()
+    cutoff = now - (max_age_hours * 3600)
+    deleted = 0
+    for filename in os.listdir(folder):
+        filepath = os.path.join(folder, filename)
+        if os.path.isfile(filepath) and os.path.getmtime(filepath) < cutoff:
+            try:
+                os.remove(filepath)
+                deleted += 1
+            except Exception as e:
+                print(f"⚠️ Could not delete {filepath}: {e}")
+    if deleted:
+        print(f"🧹 Auto-cleanup: deleted {deleted} file(s) older than {max_age_hours}h from '{folder}'")
 
 
 # -----------------------------
@@ -200,7 +264,7 @@ async def receive_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     file_id = document.file_id
     new_file = await context.bot.get_file(file_id)
-    
+
     os.makedirs("downloads", exist_ok=True)
     file_path = f"downloads/{file_id}_{document.file_name}"
     await new_file.download_to_drive(custom_path=file_path)
@@ -221,44 +285,47 @@ async def generate_newsletter(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("⚠️ No PDFs received. Please send at least one PDF first.")
         return
 
+    # Clean up files older than 24 hours before processing
+    cleanup_old_files("downloads", max_age_hours=24)
+
     await update.message.reply_text("⏳ Processing your documents with Gemini AI... Please wait, this may take a minute!")
 
     try:
         base_filename = f"downloads/newsletter_{chat_id}"
-        
+
         output_pdf = await extract_financial_updates(pdfs, base_filename)
 
         if output_pdf and os.path.exists(output_pdf):
             with open(output_pdf, 'rb') as doc:
                 await update.message.reply_document(
-                    document=doc, 
-                    filename="Financial_Newsletter.pdf", 
+                    document=doc,
+                    filename="Financial_Newsletter.pdf",
                     caption="✅ Here is your summarized newsletter!"
                 )
         else:
             await update.message.reply_text("❌ Failed to generate the document. There might be an issue with processing.")
-    
+
     except Exception as e:
         await update.message.reply_text(f"❌ An error occurred: {e}")
-        
+
     finally:
         # Cleanup routine
         for pdf in pdfs:
             if os.path.exists(pdf):
                 os.remove(pdf)
-        
+
         user_sessions[chat_id] = []
 
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
-    
+
     if not token:
         print("❌ TELEGRAM_BOT_TOKEN not found in .env file")
         print(f"📍 Current working directory: {os.getcwd()}")
         print(f"📍 .env path: {os.path.join(os.getcwd(), '.env')}")
         print(f"📍 .env exists: {os.path.exists('.env')}")
         return
-        
+
     print("🤖 Starting Telegram Bot...")
     application = Application.builder().token(token).build()
 
